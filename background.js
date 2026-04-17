@@ -1,3 +1,16 @@
+// ── Listen for session control messages from popup.js ──
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === "START_SESSION") {
+    startSession();
+    sendResponse && sendResponse({ ok: true });
+    return true;
+  }
+  if (message.type === "STOP_SESSION") {
+    stopSession();
+    sendResponse && sendResponse({ ok: true });
+    return true;
+  }
+});
 const API_KEY = "AIzaSyDZi7ARPwDvj9Ea5w7ZNTlFPxeH5FqRl2w";
 const PROJECT_ID = "employee-management-12704";
 const FIRESTORE_URL = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/screenshots`;
@@ -5,28 +18,28 @@ const ALARM_NAME = "screenshot-timer";
 
 // ── Helpers ──
 
-const genSessionId = () =>
-  Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-
 function formatTime(ms) {
   const s = Math.floor(ms / 1000);
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m ${s % 60}s`;
 }
 
-// Random delay for next screenshot (in minutes)
+function toSeconds(ms) {
+  return Math.round(ms / 1000);
+}
+
 function randomDelayMinutes() {
   return 0.5;
-  // return 0.5 + Math.random() * 14.5; // between 30s and 15 minutes
+  // return 30; // between 30s and 15 minutes
 }
 
 // ── Load state from storage ──
 
 async function getState() {
   return new Promise((resolve) => {
-    chrome.storage.local.get(["user", "tracking", "totalTime"], (res) => {
+    chrome.storage.local.get(["user", "session", "totalTime"], (res) => {
       resolve({
         user: res.user || null,
-        tracking: res.tracking || null,
+        session: res.session || null,
         totalTime: res.totalTime || 0,
       });
     });
@@ -89,9 +102,9 @@ async function saveToFirestore(fields, user) {
 // ── Capture Screenshot & Save ──
 
 async function captureAndSave() {
-  const { user, tracking } = await getState();
-  if (!user || !tracking) {
-    console.log("📸 Skipped — no user or tracking inactive");
+  const { user, session } = await getState();
+  if (!user || !session) {
+    console.log("📸 Skipped — no user or session inactive");
     return;
   }
 
@@ -107,7 +120,6 @@ async function captureAndSave() {
       return;
     }
 
-    // captureVisibleTab fails on chrome:// and other restricted pages
     let screenshot;
     try {
       screenshot = await chrome.tabs.captureVisibleTab(null, {
@@ -123,16 +135,18 @@ async function captureAndSave() {
       {
         userId: { stringValue: user.uid },
         timestamp: { integerValue: String(Date.now()) },
-        sessionId: { stringValue: tracking.sessionId },
+        sessionId: { stringValue: session.sessionId },
         screenshot: { stringValue: screenshot },
         activeTabUrl: { stringValue: tab?.url || "unknown" },
       },
       user,
     );
 
-    const elapsed = Date.now() - tracking.startTime;
+    // Log the required data structure dynamically
+
+    const times = calculateTimes(session);
     console.log(
-      `📸 Saved | Session: ${formatTime(elapsed)} | Tab: ${tab?.url || "unknown"}`,
+      `📸 Saved | Total: ${formatTime(times.totalSessionTime)} | Active: ${formatTime(times.activeTime)} | Idle: ${formatTime(times.totalIdleTime)} | Tab: ${tab?.url || "unknown"}`,
     );
   } catch (e) {
     console.error("📸 Error:", e.message);
@@ -149,38 +163,202 @@ async function scheduleNextCapture() {
   console.log(`⏰ Next screenshot in ${Math.round(delay * 60)}s`);
 }
 
-// ── Start / Stop Tracking ──
+// ── Time Calculation ──
 
-async function startTracking(mode) {
-  const { user, tracking } = await getState();
-  if (!user || tracking) return;
+function calculateTimes(session) {
+  const now = Date.now();
+  const totalSessionTime = now - session.sessionStartTime;
 
-  const sessionData = {
-    sessionId: genSessionId(),
-    startTime: Date.now(),
-  };
+  // If currently idle, include the ongoing idle period
+  let currentIdleDuration = 0;
+  if (session.idleStart) {
+    currentIdleDuration = now - session.idleStart;
+  }
 
-  await chrome.storage.local.set({ tracking: sessionData });
-  console.log(
-    `🟢 Started (${mode}) | ${user.email} | ${sessionData.sessionId}`,
-  );
+  const totalIdleTime = (session.totalIdleTime || 0) + currentIdleDuration;
+  const activeTime = totalSessionTime - totalIdleTime;
 
-  captureAndSave(); // First capture immediately
+  return { totalSessionTime, totalIdleTime, activeTime };
 }
 
-async function stopTracking(mode) {
-  const { user, tracking, totalTime } = await getState();
-  if (!tracking) return;
+// ── Session Start (Manual — login) ──
 
-  const duration = Date.now() - tracking.startTime;
+async function startSession() {
+  const { user, session } = await getState();
+  if (!user) {
+    console.log("⚠️ Cannot start session — no user logged in");
+    return;
+  }
+
+  // Prevent duplicate session starts
+  if (session) {
+    console.log("⚠️ Session already active — ignoring duplicate start");
+    return;
+  }
+
+  // Create session doc in Firestore and use docId as sessionId
+  const SESSIONS_URL = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/sessions`;
+  const startTime = Date.now();
+  const sessionFields = {
+    startTime: { timestampValue: new Date(startTime).toISOString() },
+    idleTime: { integerValue: "0" },
+    activeTime: { integerValue: "0" },
+    duration: { integerValue: "0" },
+  };
+  try {
+    const res = await fetch(SESSIONS_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${user.idToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ fields: sessionFields }),
+    });
+    if (!res.ok) throw new Error("Failed to create session doc");
+    const data = await res.json();
+    // docId is the last segment of the name field
+    const docId = data.name.split("/").pop();
+    const sessionData = {
+      sessionId: docId,
+      sessionStartTime: startTime,
+      totalIdleTime: 0,
+      idleStart: null,
+    };
+    await chrome.storage.local.set({ session: sessionData });
+    console.log("══════════════════════════════════════════");
+    console.log("🟢 SESSION STARTED");
+    console.log(`   User: ${user.email} (${user.uid})`);
+    console.log(`   Session ID: ${docId}`);
+    console.log(`   Start Time: ${new Date(startTime).toLocaleString()}`);
+    console.log("══════════════════════════════════════════");
+    captureAndSave(); // First capture immediately
+  } catch (e) {
+    console.error("Failed to start session:", e);
+  }
+}
+
+// ── Session Stop (Manual — logout) ──
+
+async function stopSession(logoutUser) {
+  const { user, session, totalTime } = await getState();
+  // Use passed-in user (captured before storage removal) or fallback to storage
+  const sessionUser = logoutUser || user;
+  if (!session) {
+    console.log("⚠️ No active session to stop");
+    return;
+  }
+
+  const times = calculateTimes(session);
+
+  // PATCH session doc in Firestore using docId as sessionId
+  const docId = session.sessionId;
+  const endDate = new Date();
+  const PATCH_URL = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/sessions/${docId}?updateMask.fieldPaths=endTime&updateMask.fieldPaths=duration&updateMask.fieldPaths=idleTime&updateMask.fieldPaths=activeTime`;
+  const sessionPatch = {
+    fields: {
+      endTime: { timestampValue: endDate.toISOString() },
+      duration: { integerValue: String(times.totalSessionTime) },
+      idleTime: { integerValue: String(times.totalIdleTime) },
+      activeTime: { integerValue: String(times.activeTime) },
+    },
+  };
+  try {
+    await fetch(PATCH_URL, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${sessionUser?.idToken || user?.idToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(sessionPatch),
+    });
+    console.log("[Session] Data updated in Firestore.");
+  } catch (e) {
+    console.error("[Session] Failed to update:", e);
+  }
 
   await chrome.alarms.clear(ALARM_NAME);
-  await chrome.storage.local.remove("tracking");
-  await chrome.storage.local.set({ totalTime: totalTime + duration });
+  await chrome.storage.local.remove("session");
+  await chrome.storage.local.set({
+    totalTime: totalTime + times.totalSessionTime,
+  });
 
+  console.log("══════════════════════════════════════════");
+  console.log("🔴 SESSION ENDED");
   console.log(
-    `🔴 Stopped (${mode}) | ${user?.email} | Session: ${formatTime(duration)}`,
+    `   User: ${sessionUser?.email || "unknown"} (${sessionUser?.uid || "unknown"})`,
   );
+  console.log(`   Session ID: ${session.sessionId}`);
+  console.log(
+    `   Start Time: ${new Date(session.sessionStartTime).toLocaleString()}`,
+  );
+  console.log(`   End Time:   ${new Date().toLocaleString()}`);
+  console.log("──────────────────────────────────────────");
+  console.log(
+    `   Total Session Time: ${formatTime(times.totalSessionTime)} (${toSeconds(times.totalSessionTime)}s)`,
+  );
+  console.log(
+    `   Total Idle Time:    ${formatTime(times.totalIdleTime)} (${toSeconds(times.totalIdleTime)}s)`,
+  );
+  console.log(
+    `   Active Time:        ${formatTime(times.activeTime)} (${toSeconds(times.activeTime)}s)`,
+  );
+  console.log("══════════════════════════════════════════");
+}
+
+// ── Idle Handling (separate from session control) ──
+
+async function handleIdleStart() {
+  const { session } = await getState();
+  if (!session) return;
+
+  // Already tracking an idle period
+  if (session.idleStart) {
+    console.log("⏸️ Idle already being tracked — ignoring duplicate");
+    return;
+  }
+
+  session.idleStart = Date.now();
+  await chrome.storage.local.set({ session });
+
+  console.log("──────────────────────────────────────────");
+  console.log("⏸️ IDLE STARTED");
+  console.log(`   Idle Start: ${new Date(session.idleStart).toLocaleString()}`);
+  console.log(`   Session still running...`);
+  console.log("──────────────────────────────────────────");
+}
+
+async function handleIdleEnd() {
+  const { session } = await getState();
+  if (!session) return;
+
+  // No idle period was being tracked
+  if (!session.idleStart) {
+    console.log("▶️ Active state but no idle period was tracked — ignoring");
+    return;
+  }
+
+  const idleDuration = Date.now() - session.idleStart;
+  session.totalIdleTime = (session.totalIdleTime || 0) + idleDuration;
+  session.idleStart = null;
+  await chrome.storage.local.set({ session });
+
+  const times = calculateTimes(session);
+
+  console.log("──────────────────────────────────────────");
+  console.log("▶️ IDLE ENDED — User is active again");
+  console.log(
+    `   Idle Duration:      ${formatTime(idleDuration)} (${toSeconds(idleDuration)}s)`,
+  );
+  console.log(
+    `   Total Idle So Far:  ${formatTime(times.totalIdleTime)} (${toSeconds(times.totalIdleTime)}s)`,
+  );
+  console.log(
+    `   Total Session Time: ${formatTime(times.totalSessionTime)} (${toSeconds(times.totalSessionTime)}s)`,
+  );
+  console.log(
+    `   Active Time:        ${formatTime(times.activeTime)} (${toSeconds(times.activeTime)}s)`,
+  );
+  console.log("──────────────────────────────────────────");
 }
 
 // ── Alarm listener (wakes service worker for each capture) ──
@@ -191,48 +369,52 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
-// ── On startup: resume tracking if was active ──
+// ── On startup: resume session if was active ──
 
 async function init() {
-  const { user, tracking } = await getState();
-  if (user && tracking) {
-    // Only schedule if no alarm already exists
+  const { user, session } = await getState();
+  if (user && session) {
+    const times = calculateTimes(session);
+    console.log(
+      `👤 Resumed session for: ${user.email} | Total: ${formatTime(times.totalSessionTime)} | Active: ${formatTime(times.activeTime)} | Idle: ${formatTime(times.totalIdleTime)}`,
+    );
+
     const existing = await chrome.alarms.get(ALARM_NAME);
     if (!existing) {
-      console.log("👤 Resumed tracking for:", user.email);
       scheduleNextCapture();
-    } else {
-      console.log(
-        "👤 Resumed tracking for:",
-        user.email,
-        "| Alarm already set",
-      );
     }
   } else if (user) {
-    console.log("👤 Loaded:", user.email);
+    console.log("👤 Loaded:", user.email, "| No active session");
   }
 }
 
 init();
 
-// ── Listen for login/logout ──
+// ── Listen for login/logout (manual session control) ──
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local" || !changes.user) return;
   if (changes.user.newValue) {
     console.log("👤 Logged in:", changes.user.newValue.email);
-    startTracking("login");
+    startSession();
   } else {
-    console.log("👤 Logged out");
-    stopTracking("logout");
+    // Capture user details before they are removed from storage
+    const logoutUser = changes.user.oldValue || null;
+    console.log("👤 Logged out:", logoutUser?.email || "unknown");
+    stopSession(logoutUser);
   }
 });
 
-// ── Idle Detection ──
+// ── Idle Detection (does NOT stop session — only tracks idle time) ──
+// Set idle detection threshold to 30 seconds
+chrome.idle.setDetectionInterval(30);
 
 chrome.idle.onStateChanged.addListener((state) => {
-  if (state === "idle" || state === "locked") stopTracking("idle");
-  else getState().then(({ user }) => user && startTracking("resume"));
+  if (state === "idle" || state === "locked") {
+    handleIdleStart();
+  } else if (state === "active") {
+    handleIdleEnd();
+  }
 });
 
 chrome.runtime.onStartup.addListener(init);

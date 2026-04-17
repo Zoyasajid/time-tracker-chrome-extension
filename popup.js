@@ -8,15 +8,36 @@ const passwordInput = document.getElementById("password");
 
 const loginBtn = document.getElementById("loginBtn");
 const logoutBtn = document.getElementById("logoutBtn");
+const startBtn = document.getElementById("startBtn");
+const stopBtn = document.getElementById("stopBtn");
 
 const userEmail = document.getElementById("userEmail");
 
-// ---------- Check login state ----------
-chrome.storage.local.get("user", (res) => {
-  if (res.user) {
-    showUser(res.user);
-  }
-});
+// ---------- Check login and session state ----------
+function updateUI() {
+  chrome.storage.local.get(["user", "session"], (res) => {
+    if (res.user) {
+      showUser(res.user);
+      if (res.session) {
+        // Session active: show Stop and Logout
+        startBtn.classList.add("hidden");
+        stopBtn.classList.remove("hidden");
+      } else {
+        // No session: show Start and Logout
+        startBtn.classList.remove("hidden");
+        stopBtn.classList.add("hidden");
+      }
+      logoutBtn.classList.remove("hidden");
+    } else {
+      // Not logged in
+      loginBox.classList.remove("hidden");
+      userBox.classList.add("hidden");
+    }
+  });
+}
+
+updateUI();
+chrome.storage.onChanged.addListener(updateUI);
 
 // ---------- Login ----------
 loginBtn.addEventListener("click", async () => {
@@ -47,20 +68,40 @@ loginBtn.addEventListener("click", async () => {
   }
 });
 
+// ---------- Start Session ----------
+startBtn.addEventListener("click", () => {
+  chrome.runtime.sendMessage({ type: "START_SESSION" });
+});
+
+// ---------- Stop Session ----------
+stopBtn.addEventListener("click", () => {
+  chrome.runtime.sendMessage({ type: "STOP_SESSION" });
+});
+
 // ---------- Logout ----------
 logoutBtn.addEventListener("click", async () => {
-  await signOut();
-
-  chrome.storage.local.remove("user");
-
-  loginBox.classList.remove("hidden");
-  userBox.classList.add("hidden");
+  // End session if active, then logout
+  chrome.storage.local.get("session", async (res) => {
+    if (res.session) {
+      chrome.runtime.sendMessage({ type: "STOP_SESSION" }, async () => {
+        await signOut();
+        chrome.storage.local.remove("user");
+        loginBox.classList.remove("hidden");
+        userBox.classList.add("hidden");
+      });
+    } else {
+      await signOut();
+      chrome.storage.local.remove("user");
+      loginBox.classList.remove("hidden");
+      userBox.classList.add("hidden");
+    }
+  });
 });
 
 // ---------- UI switch ----------
+
 function showUser(user) {
   loginBox.classList.add("hidden");
   userBox.classList.remove("hidden");
-
   userEmail.innerText = user.email;
 }
