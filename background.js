@@ -32,8 +32,6 @@ function randomDelayMinutes() {
   // return 30; // between 30s and 15 minutes
 }
 
-// ── Load state from storage ──
-
 async function getState() {
   return new Promise((resolve) => {
     chrome.storage.local.get(["user", "session", "totalTime"], (res) => {
@@ -142,8 +140,12 @@ async function captureAndSave() {
       user,
     );
 
-    // Log the required data structure dynamically
+    // Notify all extension views (including popup) of screenshot success
+    // Suppress error if no receiving end (e.g., popup not open)
+    // Always attach .catch to suppress 'no receiving end' error
+    chrome.runtime.sendMessage({ type: "SCREENSHOT_SUCCESS" }).catch(() => {});
 
+    // Log the required data structure dynamically
     const times = calculateTimes(session);
     console.log(
       `📸 Saved | Total: ${formatTime(times.totalSessionTime)} | Active: ${formatTime(times.activeTime)} | Idle: ${formatTime(times.totalIdleTime)} | Tab: ${tab?.url || "unknown"}`,
