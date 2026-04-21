@@ -144,6 +144,16 @@ async function captureAndSave() {
     // Suppress error if no receiving end (e.g., popup not open)
     // Always attach .catch to suppress 'no receiving end' error
     chrome.runtime.sendMessage({ type: "SCREENSHOT_SUCCESS" }).catch(() => {});
+    // Show Chrome notification for screenshot success
+    if (chrome.notifications) {
+      chrome.notifications.create({
+        type: "basic",
+        iconUrl: "icons/icon.png",
+        title: "Screenshot captured",
+        message: "A screenshot was successfully taken.",
+        priority: 0,
+      });
+    }
 
     // Log the required data structure dynamically
     const times = calculateTimes(session);
@@ -206,6 +216,7 @@ async function startSession() {
     idleTime: { integerValue: "0" },
     activeTime: { integerValue: "0" },
     duration: { integerValue: "0" },
+    userId: { stringValue: user.uid },
   };
   try {
     const res = await fetch(SESSIONS_URL, {
@@ -225,6 +236,7 @@ async function startSession() {
       sessionStartTime: startTime,
       totalIdleTime: 0,
       idleStart: null,
+      userId: user.uid,
     };
     await chrome.storage.local.set({ session: sessionData });
     console.log("══════════════════════════════════════════");

@@ -1,3 +1,30 @@
+// ---- Screenshot Toast Notification ----
+function showScreenshotToast() {
+  const toast = document.getElementById("screenshotToast");
+  if (!toast) return;
+  toast.style.display = "block";
+  toast.style.opacity = "1";
+  toast.style.transform = "translateX(-50%) scale(1.08)";
+  setTimeout(() => {
+    toast.style.transform = "translateX(-50%) scale(1)";
+    toast.style.opacity = "0.95";
+  }, 80);
+  setTimeout(() => {
+    toast.style.opacity = "0";
+    toast.style.transform = "translateX(-50%) scale(0.95)";
+  }, 1200);
+  setTimeout(() => {
+    toast.style.display = "none";
+    toast.style.opacity = "0";
+    toast.style.transform = "translateX(-50%) scale(1)";
+  }, 1700);
+}
+
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg && msg.type === "SCREENSHOT_SUCCESS") {
+    showScreenshotToast();
+  }
+});
 import { signInWithEmailAndPassword, signOut } from "./firebase.js";
 
 const loginBox = document.getElementById("loginBox");

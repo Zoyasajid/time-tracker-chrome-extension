@@ -2,7 +2,14 @@
   "manifest_version": 3,
   "name": "Incitertech Time Tracker",
   "version": "1.0",
-  "permissions": ["storage", "idle", "tabs", "activeTab", "alarms"],
+  "permissions": [
+    "storage",
+    "idle",
+    "tabs",
+    "activeTab",
+    "alarms",
+    "notifications"
+  ],
   "host_permissions": [
     "<all_urls>",
     "https://identitytoolkit.googleapis.com/*",
