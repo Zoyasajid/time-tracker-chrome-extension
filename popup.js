@@ -39,6 +39,8 @@ const startBtn = document.getElementById("startBtn");
 const stopBtn = document.getElementById("stopBtn");
 
 const userEmail = document.getElementById("userEmail");
+const trackerTime = document.getElementById("trackerTime");
+let trackerTimerInterval = null;
 
 // ---------- Check login and session state ----------
 function updateUI() {
@@ -49,12 +51,43 @@ function updateUI() {
         // Session active: show Stop and Logout
         startBtn.classList.add("hidden");
         stopBtn.classList.remove("hidden");
+        // Start tracker timer
+        startTrackerTimer(res.session.sessionStartTime);
       } else {
         // No session: show Start and Logout
         startBtn.classList.remove("hidden");
         stopBtn.classList.add("hidden");
+        stopTrackerTimer();
       }
       logoutBtn.classList.remove("hidden");
+      function startTrackerTimer(sessionStartTime) {
+        stopTrackerTimer();
+        if (!trackerTime) return;
+        if (!sessionStartTime) {
+          trackerTime.innerText = "Time: 00h 00m 00s";
+          return;
+        }
+        function update() {
+          const now = Date.now();
+          const elapsed = now - sessionStartTime;
+          trackerTime.innerText = "Time: " + formatTime(elapsed);
+        }
+        update();
+        trackerTimerInterval = setInterval(update, 1000);
+      }
+
+      function stopTrackerTimer() {
+        if (trackerTimerInterval) {
+          clearInterval(trackerTimerInterval);
+          trackerTimerInterval = null;
+        }
+        if (trackerTime) trackerTime.innerText = "Time: 00h 00m 00s";
+      }
+
+      function formatTime(ms) {
+        const s = Math.floor(ms / 1000);
+        return `${String(Math.floor(s / 3600)).padStart(2, "0")}h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m ${String(s % 60).padStart(2, "0")}s`;
+      }
     } else {
       // Not logged in
       loginBox.classList.remove("hidden");
@@ -96,7 +129,12 @@ loginBtn.addEventListener("click", async () => {
 });
 
 // ---------- Start Session ----------
-startBtn.addEventListener("click", () => {
+
+startBtn.addEventListener("click", async () => {
+  // Show instruction before starting session
+  alert(
+    "Please select 'Entire Screen' to enable tracking.\n\nYou will be prompted to pick a screen.\n\nTracking will only start if you select 'Entire Screen'.",
+  );
   chrome.runtime.sendMessage({ type: "START_SESSION" });
 });
 

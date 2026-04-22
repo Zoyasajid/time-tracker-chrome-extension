@@ -1,3 +1,53 @@
+// ── Offscreen Document Management ──
+async function ensureOffscreenDocument() {
+  const offscreenUrl = "offscreen.html";
+  if (
+    chrome.offscreen &&
+    chrome.offscreen.hasDocument &&
+    chrome.offscreen.createDocument
+  ) {
+    const exists = await chrome.offscreen.hasDocument();
+    if (!exists) {
+      await chrome.offscreen.createDocument({
+        url: offscreenUrl,
+        reasons: [chrome.offscreen.Reason.DISPLAY_MEDIA],
+        justification:
+          "Screen capture and screenshot processing in background.",
+      });
+    }
+  } else {
+    console.error("chrome.offscreen API is not available in this environment.");
+  }
+}
+
+async function startScreenCaptureViaOffscreen() {
+  await ensureOffscreenDocument();
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: "START_SCREEN_CAPTURE" }, (response) => {
+      resolve(response && response.granted);
+    });
+  });
+}
+
+async function stopScreenCaptureViaOffscreen() {
+  chrome.runtime.sendMessage({ type: "STOP_SCREEN_CAPTURE" });
+}
+
+async function captureScreenshotViaOffscreen() {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: "CAPTURE_SCREENSHOT" }, (response) => {
+      resolve(response && response.screenshot);
+    });
+  });
+}
+
+function startPeriodicCaptureViaOffscreen(intervalMs) {
+  chrome.runtime.sendMessage({ type: "START_PERIODIC_CAPTURE", intervalMs });
+}
+
+function stopPeriodicCaptureViaOffscreen() {
+  chrome.runtime.sendMessage({ type: "STOP_PERIODIC_CAPTURE" });
+}
 // ── Listen for session control messages from popup.js ──
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "START_SESSION") {
@@ -8,6 +58,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "STOP_SESSION") {
     stopSession();
     sendResponse && sendResponse({ ok: true });
+    return true;
+  }
+  if (message.type === "SCREEN_CAPTURE_ENDED") {
+    // Auto-stop session if stream ends
+    stopSession();
+    if (chrome.notifications) {
+      chrome.notifications.create({
+        type: "basic",
+        iconUrl: "icons/icon.png",
+        title: "Session Ended",
+        message: "Screen sharing was stopped. Your session has ended.",
+        priority: 2,
+      });
+    }
     return true;
   }
 });
@@ -28,8 +92,8 @@ function toSeconds(ms) {
 }
 
 function randomDelayMinutes() {
-  return 0.5;
-  // return 30; // between 30s and 15 minutes
+  // return 0.5;
+  return 15; //
 }
 
 async function getState() {
@@ -75,7 +139,7 @@ async function refreshToken(user) {
 // ── Firestore Save (with auto-retry on 401) ──
 
 async function saveToFirestore(fields, user) {
-  const body = JSON.stringify({ fields });
+  const body = JSON.stringify({ fields }); // Only imageUrl, createdAt, sessionId allowed
   const headers = () => ({
     Authorization: `Bearer ${user.idToken}`,
     "Content-Type": "application/json",
@@ -94,83 +158,60 @@ async function saveToFirestore(fields, user) {
       body,
     });
   }
-  if (!res.ok) throw new Error("Firestore save failed: " + res.status);
+  if (!res.ok) {
+    const errorText = await res.text();
+    console.error("Firestore save failed:", res.status, errorText);
+    throw new Error("Firestore save failed: " + res.status);
+  }
+  // Only imageUrl, createdAt, sessionId are stored. No base64 or screenshot field.
 }
 
-// ── Capture Screenshot & Save ──
+// ── Screen Capture State ──
 
-async function captureAndSave() {
-  const { user, session } = await getState();
-  if (!user || !session) {
-    console.log("📸 Skipped — no user or session inactive");
-    return;
-  }
-
-  try {
-    const [tab] = await chrome.tabs.query({
-      active: true,
-      currentWindow: true,
-    });
-
-    if (!tab) {
-      console.log("📸 Skipped — no active tab");
-      scheduleNextCapture();
+// Handle screenshot upload when received from offscreen.js
+chrome.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
+  if (message.type === "PERIODIC_SCREENSHOT" && message.screenshot) {
+    // message.screenshot is now a Cloudinary URL or null
+    if (!message.screenshot) {
+      console.error("Cloudinary upload failed, not saving to Firestore.");
       return;
     }
-
-    let screenshot;
+    const { user, session } = await getState();
+    if (!user || !session) return;
     try {
-      screenshot = await chrome.tabs.captureVisibleTab(null, {
-        format: "png",
-      });
-    } catch (captureErr) {
-      console.log("📸 Skipped — cannot capture this page:", tab.url);
-      scheduleNextCapture();
-      return;
+      await saveToFirestore(
+        {
+          screenshot: { stringValue: message.screenshot },
+          sessionId: { stringValue: session.sessionId },
+          userId: { stringValue: user.uid },
+          timestamp: { integerValue: String(Date.now()) },
+        },
+        user,
+      );
+      if (chrome.notifications) {
+        chrome.notifications.create({
+          type: "basic",
+          iconUrl: "icons/icon.png",
+          title: "Screenshot captured",
+          message: "A screenshot was successfully taken.",
+          priority: 0,
+        });
+      }
+      const times = calculateTimes(session);
+      console.log(
+        `📸 Saved | Total: ${formatTime(times.totalSessionTime)} | Active: ${formatTime(times.activeTime)} | Idle: ${formatTime(times.totalIdleTime)} | Source: screen-capture`,
+      );
+    } catch (e) {
+      console.error("📸 Error:", e.message);
     }
-
-    await saveToFirestore(
-      {
-        userId: { stringValue: user.uid },
-        timestamp: { integerValue: String(Date.now()) },
-        sessionId: { stringValue: session.sessionId },
-        screenshot: { stringValue: screenshot },
-        activeTabUrl: { stringValue: tab?.url || "unknown" },
-      },
-      user,
-    );
-
-    // Notify all extension views (including popup) of screenshot success
-    // Suppress error if no receiving end (e.g., popup not open)
-    // Always attach .catch to suppress 'no receiving end' error
-    chrome.runtime.sendMessage({ type: "SCREENSHOT_SUCCESS" }).catch(() => {});
-    // Show Chrome notification for screenshot success
-    if (chrome.notifications) {
-      chrome.notifications.create({
-        type: "basic",
-        iconUrl: "icons/icon.png",
-        title: "Screenshot captured",
-        message: "A screenshot was successfully taken.",
-        priority: 0,
-      });
-    }
-
-    // Log the required data structure dynamically
-    const times = calculateTimes(session);
-    console.log(
-      `📸 Saved | Total: ${formatTime(times.totalSessionTime)} | Active: ${formatTime(times.activeTime)} | Idle: ${formatTime(times.totalIdleTime)} | Tab: ${tab?.url || "unknown"}`,
-    );
-  } catch (e) {
-    console.error("📸 Error:", e.message);
   }
-
-  scheduleNextCapture();
-}
+});
 
 // ── Schedule next random capture ──
 
 async function scheduleNextCapture() {
-  const delay = randomDelayMinutes();
+  // const delay = randomDelayMinutes();
+  const delay = 15;
   await chrome.alarms.create(ALARM_NAME, { delayInMinutes: delay });
   console.log(`⏰ Next screenshot in ${Math.round(delay * 60)}s`);
 }
@@ -201,10 +242,24 @@ async function startSession() {
     console.log("⚠️ Cannot start session — no user logged in");
     return;
   }
-
-  // Prevent duplicate session starts
   if (session) {
     console.log("⚠️ Session already active — ignoring duplicate start");
+    return;
+  }
+
+  // Delegate screen capture to offscreen.js
+  const granted = await startScreenCaptureViaOffscreen();
+  if (!granted) {
+    if (chrome.notifications) {
+      chrome.notifications.create({
+        type: "basic",
+        iconUrl: "icons/icon.png",
+        title: "Screen Selection Required",
+        message:
+          "Please select 'Entire Screen' for full session capture. Session will not start.",
+        priority: 2,
+      });
+    }
     return;
   }
 
@@ -245,7 +300,8 @@ async function startSession() {
     console.log(`   Session ID: ${docId}`);
     console.log(`   Start Time: ${new Date(startTime).toLocaleString()}`);
     console.log("══════════════════════════════════════════");
-    captureAndSave(); // First capture immediately
+    // Start screenshot loop in offscreen.js
+    chrome.runtime.sendMessage({ type: "START_SCREENSHOT_LOOP" });
   } catch (e) {
     console.error("Failed to start session:", e);
   }
@@ -255,16 +311,15 @@ async function startSession() {
 
 async function stopSession(logoutUser) {
   const { user, session, totalTime } = await getState();
-  // Use passed-in user (captured before storage removal) or fallback to storage
   const sessionUser = logoutUser || user;
   if (!session) {
     console.log("⚠️ No active session to stop");
     return;
   }
 
-  const times = calculateTimes(session);
+  // (Screen stream and DOM elements are managed only in offscreen.js)
 
-  // PATCH session doc in Firestore using docId as sessionId
+  const times = calculateTimes(session);
   const docId = session.sessionId;
   const endDate = new Date();
   const PATCH_URL = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/sessions/${docId}?updateMask.fieldPaths=endTime&updateMask.fieldPaths=duration&updateMask.fieldPaths=idleTime&updateMask.fieldPaths=activeTime`;
@@ -377,11 +432,7 @@ async function handleIdleEnd() {
 
 // ── Alarm listener (wakes service worker for each capture) ──
 
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === ALARM_NAME) {
-    captureAndSave();
-  }
-});
+// (Legacy alarm-based screenshot logic removed. All screenshots are handled by offscreen.js)
 
 // ── On startup: resume session if was active ──
 
@@ -410,7 +461,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local" || !changes.user) return;
   if (changes.user.newValue) {
     console.log("👤 Logged in:", changes.user.newValue.email);
-    startSession();
+    // No permission request here; handled in popup.js
   } else {
     // Capture user details before they are removed from storage
     const logoutUser = changes.user.oldValue || null;
