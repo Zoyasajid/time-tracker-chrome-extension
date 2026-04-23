@@ -115,7 +115,7 @@ function stopScreenCapture() {
     canvasElement.remove();
     canvasElement = null;
   }
-  stopPeriodicCapture();
+  stopScreenshotLoop();
 }
 
 async function captureScreenshot() {
